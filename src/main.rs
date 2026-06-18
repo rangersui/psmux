@@ -3309,7 +3309,7 @@ fn run_main() -> io::Result<()> {
                                 i += 1;
                             }
                         }
-                        s => { cmd.push_str(&format!(" {}", s)); }
+                        s => { cmd.push_str(&format!(" {}", crate::util::quote_arg(s))); }
                     }
                     i += 1;
                 }

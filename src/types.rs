@@ -273,6 +273,10 @@ pub struct PipePaneState {
     pub process: Option<std::process::Child>,
     pub stdin: bool,
     pub stdout: bool,
+    /// Non-blocking writer: sends raw bytes to a background thread that
+    /// writes to the pipe process stdin. Bounded channel provides backpressure
+    /// without blocking the server main loop.
+    pub pipe_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
 }
 
 /// Wait-for channel state

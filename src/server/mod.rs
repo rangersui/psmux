@@ -1012,65 +1012,120 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         // 5ms (client recently active) up to 50ms (fully idle).  This
         // dramatically reduces CPU usage when the session is idle while
         // keeping responsiveness high during interaction.
+        // Reap dead pipe-pane processes every tick (not just when data arrives),
+        // so idle sessions don't accumulate zombie pipe processes.
+        if !app.pipe_panes.is_empty() {
+            app.pipe_panes.retain_mut(|pipe| {
+                if let Some(ref mut proc) = pipe.process {
+                    match proc.try_wait() {
+                        Ok(Some(_)) => {
+                            pipe.pipe_tx = None; // drop sender so writer thread exits
+                            return false; // process exited
+                        }
+                        Err(_) => {
+                            // OS error querying process — treat as dead
+                            pipe.pipe_tx = None;
+                            return false;
+                        }
+                        Ok(None) => {} // still running
+                    }
+                }
+                if pipe.pipe_tx.is_none() {
+                    // Writer channel gone — kill the process to avoid orphans
+                    if let Some(ref mut proc) = pipe.process {
+                        let _ = proc.kill();
+                    }
+                    return false;
+                }
+                true
+            });
+        }
+
         let data_ready = crate::types::PTY_DATA_READY.swap(false, std::sync::atomic::Ordering::AcqRel);
         if data_ready {
             state_dirty = true;
-            // Drain output ring buffers and send %output notifications to control clients
-            if !app.control_clients.is_empty() {
-                // Collect output from all panes first, then dispatch to clients
-                let mut pane_outputs: Vec<(usize, String)> = Vec::new();
+            // Drain output ring buffers for control clients and pipe-pane
+            let has_consumers = !app.control_clients.is_empty() || !app.pipe_panes.is_empty();
+            if has_consumers {
+                // Collect raw bytes from all panes first, then dispatch
+                let mut pane_outputs: Vec<(usize, Vec<u8>)> = Vec::new();
                 for win in &app.windows {
                     crate::tree::for_each_pane(&win.root, &mut |pane: &crate::types::Pane| {
                         if let Ok(mut ring) = pane.output_ring.lock() {
                             if !ring.is_empty() {
                                 let bytes: Vec<u8> = ring.drain(..).collect();
-                                let data = String::from_utf8_lossy(&bytes).to_string();
-                                pane_outputs.push((pane.id, data));
+                                pane_outputs.push((pane.id, bytes));
                             }
                         }
                     });
                 }
                 // Dispatch to each control client with pause-after logic
-                let now = std::time::Instant::now();
-                for (pane_id, data) in &pane_outputs {
-                    for client in app.control_clients.values_mut() {
-                        if client.paused_panes.contains(pane_id) {
-                            continue;
-                        }
-                        if client.output_paused_panes.contains(pane_id) {
-                            // Pane is paused for this client; drop output
-                            continue;
-                        }
-                        if let Some(pause_secs) = client.pause_after_secs {
-                            // Track output timing per pane
-                            let last = client.pane_last_output.entry(*pane_id).or_insert(now);
-                            let age = now.duration_since(*last);
-                            *last = now;
-                            if age.as_secs() >= pause_secs {
-                                // Client fell behind: pause this pane
-                                client.output_paused_panes.insert(*pane_id);
-                                let _ = client.notification_tx.try_send(
-                                    crate::types::ControlNotification::Pause { pane_id: *pane_id }
-                                );
+                // (control clients need String; convert once per pane, not per client)
+                if !app.control_clients.is_empty() {
+                    let now = std::time::Instant::now();
+                    for (pane_id, bytes) in &pane_outputs {
+                        let data_string = String::from_utf8_lossy(bytes).into_owned();
+                        for client in app.control_clients.values_mut() {
+                            if client.paused_panes.contains(pane_id) {
                                 continue;
                             }
-                            // Send as extended-output with age
-                            let age_ms = age.as_millis() as u64;
-                            let _ = client.notification_tx.try_send(
-                                crate::types::ControlNotification::ExtendedOutput {
-                                    pane_id: *pane_id,
-                                    age_ms,
-                                    data: data.clone(),
+                            if client.output_paused_panes.contains(pane_id) {
+                                // Pane is paused for this client; drop output
+                                continue;
+                            }
+                            if let Some(pause_secs) = client.pause_after_secs {
+                                // Track output timing per pane
+                                let last = client.pane_last_output.entry(*pane_id).or_insert(now);
+                                let age = now.duration_since(*last);
+                                *last = now;
+                                if age.as_secs() >= pause_secs {
+                                    // Client fell behind: pause this pane
+                                    client.output_paused_panes.insert(*pane_id);
+                                    let _ = client.notification_tx.try_send(
+                                        crate::types::ControlNotification::Pause { pane_id: *pane_id }
+                                    );
+                                    continue;
                                 }
-                            );
-                        } else {
-                            // No pause-after: send normal %output
-                            let _ = client.notification_tx.try_send(
-                                crate::types::ControlNotification::Output {
-                                    pane_id: *pane_id,
-                                    data: data.clone(),
+                                // Send as extended-output with age
+                                let age_ms = age.as_millis() as u64;
+                                let _ = client.notification_tx.try_send(
+                                    crate::types::ControlNotification::ExtendedOutput {
+                                        pane_id: *pane_id,
+                                        age_ms,
+                                        data: data_string.clone(),
+                                    }
+                                );
+                            } else {
+                                // No pause-after: send normal %output
+                                let _ = client.notification_tx.try_send(
+                                    crate::types::ControlNotification::Output {
+                                        pane_id: *pane_id,
+                                        data: data_string.clone(),
+                                    }
+                                );
+                            }
+                        }
+                    }
+                }
+                // Forward raw bytes to pipe-pane writer threads (non-blocking)
+                if !app.pipe_panes.is_empty() {
+                    for (pane_id, bytes) in &pane_outputs {
+                        for pipe in app.pipe_panes.iter_mut() {
+                            if pipe.pane_id == *pane_id {
+                                if let Some(ref tx) = pipe.pipe_tx {
+                                    use std::sync::mpsc::TrySendError;
+                                    match tx.try_send(bytes.clone()) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => {
+                                            // Channel full — drop this batch, keep pipe alive
+                                        }
+                                        Err(TrySendError::Disconnected(_)) => {
+                                            // Writer thread died — mark for cleanup
+                                            pipe.pipe_tx = None;
+                                        }
+                                    }
                                 }
-                            );
+                            }
                         }
                     }
                 }
@@ -3578,37 +3633,52 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     let _ = resp.send(output);
                 }
                 CtrlReq::PipePane(cmd, stdin, stdout, toggle) => {
+                    // Helper: close a pipe-pane for a given pane_id.
+                    // `graceful`: drop the channel sender so the writer thread can
+                    // flush buffered data before stdin closes. The process exits
+                    // naturally on stdin EOF.
+                    // `!graceful` (replace): kill immediately — old data doesn't matter.
+                    fn close_pipe_pane(pipe_panes: &mut Vec<PipePaneState>, pane_id: usize, graceful: bool) {
+                        if let Some(idx) = pipe_panes.iter().position(|p| p.pane_id == pane_id) {
+                            let mut pipe = pipe_panes.remove(idx);
+                            // Drop sender: writer thread sees Disconnected, flushes, exits.
+                            // This closes stdin_handle, causing the process to get EOF.
+                            pipe.pipe_tx = None;
+                            if !graceful {
+                                if let Some(ref mut proc) = pipe.process {
+                                    let _ = proc.kill();
+                                }
+                            }
+                        }
+                    }
+
                     let win = &app.windows[app.active_idx];
                     let pane_id = get_active_pane_id(&win.root, &win.active_path).unwrap_or(0);
                     let has_existing = app.pipe_panes.iter().any(|p| p.pane_id == pane_id);
-                    
+
                     if cmd.is_empty() {
-                        // No command: close any existing pipe on this pane
-                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
-                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
-                                let _ = proc.kill();
-                            }
-                            app.pipe_panes.remove(idx);
-                        }
+                        // No command: graceful close (let writer drain)
+                        close_pipe_pane(&mut app.pipe_panes, pane_id, true);
                     } else if toggle && has_existing {
-                        // -o flag with existing pipe: close it (toggle off), don't start new
-                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
-                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
-                                let _ = proc.kill();
-                            }
-                            app.pipe_panes.remove(idx);
-                        }
+                        // -o flag with existing pipe: graceful close (toggle off)
+                        close_pipe_pane(&mut app.pipe_panes, pane_id, true);
                     } else {
-                        // Close any existing pipe first (replace)
-                        if let Some(idx) = app.pipe_panes.iter().position(|p| p.pane_id == pane_id) {
-                            if let Some(ref mut proc) = app.pipe_panes[idx].process {
-                                let _ = proc.kill();
-                            }
-                            app.pipe_panes.remove(idx);
+                        // Replace: kill old pipe immediately, start new one
+                        close_pipe_pane(&mut app.pipe_panes, pane_id, false);
+                        // Drain any stale output from this pane's ring so the pipe
+                        // only receives output produced after pipe-pane starts.
+                        for win in &app.windows {
+                            crate::tree::for_each_pane(&win.root, &mut |pane: &crate::types::Pane| {
+                                if pane.id == pane_id {
+                                    if let Ok(mut ring) = pane.output_ring.lock() {
+                                        ring.clear();
+                                    }
+                                }
+                            });
                         }
                         // Start new pipe
                         let (shell_prog, shell_args) = crate::commands::resolve_run_shell();
-                        let process = {
+                        let mut process = {
                             let mut c = std::process::Command::new(&shell_prog);
                             for a in &shell_args { c.arg(a); }
                             c.arg(&cmd);
@@ -3618,12 +3688,38 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             { use crate::platform::HideWindowCommandExt; c.hide_window(); }
                             c.spawn().ok()
                         };
-                        
+                        // Spawn a background writer thread so stdin.write_all
+                        // never blocks the server main loop. Bounded channel (64
+                        // slots) provides backpressure: if the pipe process can't
+                        // keep up, the server drops data instead of stalling.
+                        let pipe_tx = if let Some(ref mut child) = process {
+                            if let Some(mut stdin_handle) = child.stdin.take() {
+                                let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(64);
+                                let spawned = std::thread::Builder::new()
+                                    .name(format!("pipe-pane-writer-{}", pane_id))
+                                    .spawn(move || {
+                                        use std::io::Write;
+                                        while let Ok(data) = rx.recv() {
+                                            if stdin_handle.write_all(&data).is_err() {
+                                                break;
+                                            }
+                                            let _ = stdin_handle.flush();
+                                        }
+                                    });
+                                if spawned.is_ok() { Some(tx) } else { None }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
                         app.pipe_panes.push(PipePaneState {
                             pane_id,
                             process,
                             stdin,
                             stdout,
+                            pipe_tx,
                         });
                     }
                 }
